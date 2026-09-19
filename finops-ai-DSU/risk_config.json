@@ -1,0 +1,32 @@
+{
+  "weights": {
+    "environment_risk": 0.25,
+    "criticality_risk": 0.25,
+    "capacity_risk": 0.2,
+    "uncertainty_risk": 0.15,
+    "dependency_risk": 0.15
+  },
+  "factor_scores": {
+    "environment_production": 90,
+    "environment_nonprod": 20,
+    "criticality_high": 90,
+    "criticality_low": 30,
+    "dependency_database": 70,
+    "dependency_other": 25,
+    "uncertainty_high": 60,
+    "uncertainty_low": 20
+  },
+  "capacity_thresholds": {
+    "tight": 15,
+    "moderate": 30
+  },
+  "capacity_scores": {
+    "tight": 85,
+    "moderate": 50,
+    "safe": 15
+  },
+  "verdict_thresholds": {
+    "low_max": 30,
+    "medium_max": 60
+  }
+}
