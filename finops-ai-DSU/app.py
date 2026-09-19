@@ -29,6 +29,12 @@ from risk_config_store import (
     load_risk_config,
     save_risk_config,
 )
+from config import (
+    DEFAULT_CONFIG,
+    validate_config,
+    load_config,
+    save_config,
+)
 from beeceptor_gateway import dispatch_to_beeceptor
 from localstack_service import LocalStackService
 from terraform_generator import TerraformGitOpsGenerator
@@ -389,8 +395,11 @@ if "beeceptor_results" not in st.session_state:
     st.session_state.beeceptor_results = {}
 if "rejected_servers" not in st.session_state:
     st.session_state.rejected_servers = set()
+if "config" not in st.session_state:
+    st.session_state.config = load_config()
+# risk_config kept as a live view into config["risk"] for backward compat
 if "risk_config" not in st.session_state:
-    st.session_state.risk_config = load_risk_config()
+    st.session_state.risk_config = st.session_state.config["risk"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Core Data Pipeline (Deterministic Execution)
@@ -460,77 +469,158 @@ with st.sidebar:
         st.caption("ℹ️ Deterministic math active. Enter Gemini key for cognitive narratives.")
 
     st.divider()
-    with st.expander("⚙️ SRE Risk Policy Configuration", expanded=False):
+    with st.expander("⚙️ Policy Settings", expanded=False):
         st.markdown(
             "<p style='color:#94A3B8;font-size:0.80rem;margin-top:-6px;line-height:1.4;'>"
-            "Dynamic enterprise risk engine: customize rejection bars, auto-approval cutoffs, and workload weights in real-time."
+            "Tune every detection threshold, sizing margin, schedule, and risk weight live — "
+            "changes are validated before reaching any agent."
             "</p>",
             unsafe_allow_html=True,
         )
 
-        curr_cfg = st.session_state.risk_config
-        curr_vt = curr_cfg.get("verdict_thresholds", {"low_max": 30, "medium_max": 60})
-        curr_fs = curr_cfg.get("factor_scores", {})
+        cfg = copy.deepcopy(st.session_state.config)
 
-        st.markdown("**Verdict Cutoffs:**")
-        reject_threshold = st.slider(
-            "Reject Above Risk Score",
-            min_value=35,
-            max_value=95,
-            value=int(curr_vt.get("medium_max", 60)),
-            help="SRE blocks autonomous execution for workloads exceeding this score.",
-            key="slider_reject_threshold",
+        # ── Detection thresholds (Agent 1) ────────────────────────────────
+        st.markdown("**🕵️ Detection Thresholds (Agent 1)**")
+        cfg["detection"]["overprovisioned_cpu_max_pct"] = st.slider(
+            "Overprovisioned: CPU% below", 1.0, 100.0,
+            float(cfg["detection"]["overprovisioned_cpu_max_pct"]),
+            step=1.0, key="sl_cpu_max",
+            help="Servers with p95 CPU below this are overprovisioning candidates.",
         )
-        approve_threshold = st.slider(
-            "Auto-Approve Below Risk Score",
-            min_value=5,
-            max_value=max(10, reject_threshold - 5),
-            value=min(int(curr_vt.get("low_max", 30)), max(10, reject_threshold - 5)),
-            help="Workloads at or below this score are cleared for immediate autonomous execution.",
-            key="slider_approve_threshold",
+        cfg["detection"]["overprovisioned_ram_max_ratio"] = st.slider(
+            "Overprovisioned: RAM ratio below", 0.05, 1.0,
+            float(cfg["detection"]["overprovisioned_ram_max_ratio"]),
+            step=0.05, key="sl_ram_ratio",
+            help="Servers with p95 RAM/total RAM below this ratio are candidates.",
         )
-
-        st.markdown("**Enterprise Factor Base Scores:**")
-        prod_risk = st.slider(
-            "Production Base Risk",
-            0, 100,
-            int(curr_fs.get("environment_production", 90)),
-            help="E.g., adjust from 90 to 80 if enterprise policy is more tolerant of production tuning.",
-            key="slider_prod_risk",
+        cfg["detection"]["zombie_gpu_util_max_pct"] = st.slider(
+            "Zombie GPU: util% below", 0.0, 20.0,
+            float(cfg["detection"]["zombie_gpu_util_max_pct"]),
+            step=0.5, key="sl_gpu_util",
         )
-        crit_risk = st.slider(
-            "Critical Workload Risk (DB/API)",
-            0, 100,
-            int(curr_fs.get("criticality_high", 90)),
-            help="Base risk applied to mission-critical web APIs and databases.",
-            key="slider_crit_risk",
+        cfg["detection"]["zombie_gpu_idle_hours_min"] = st.number_input(
+            "Zombie GPU: idle hours minimum", 0.0, 168.0,
+            float(cfg["detection"]["zombie_gpu_idle_hours_min"]),
+            step=1.0, key="ni_gpu_idle",
+        )
+        cfg["detection"]["zombie_network_max_mb_day"] = st.number_input(
+            "Zombie: network MB/day below", 0.0, 1000.0,
+            float(cfg["detection"]["zombie_network_max_mb_day"]),
+            step=1.0, key="ni_net_mb",
         )
 
-        new_config = copy.deepcopy(curr_cfg)
-        new_config["verdict_thresholds"] = {"low_max": approve_threshold, "medium_max": reject_threshold}
-        new_config["factor_scores"]["environment_production"] = prod_risk
-        new_config["factor_scores"]["criticality_high"] = crit_risk
+        # ── Sizing safety margins (Agent 2) ───────────────────────────────
+        st.markdown("**📐 Sizing Safety Margins (Agent 2)**")
+        cfg["sizing"]["ram_headroom_over_peak"] = st.slider(
+            "RAM headroom over peak (×)", 1.0, 2.0,
+            float(cfg["sizing"]["ram_headroom_over_peak"]),
+            step=0.05, key="sl_ram_peak",
+        )
+        cfg["sizing"]["ram_headroom_over_p95"] = st.slider(
+            "RAM headroom over p95 (×)", 1.0, 2.0,
+            float(cfg["sizing"]["ram_headroom_over_p95"]),
+            step=0.05, key="sl_ram_p95",
+        )
+        cfg["sizing"]["vcpu_headroom_over_peak"] = st.slider(
+            "vCPU headroom over peak (×)", 1.0, 2.0,
+            float(cfg["sizing"]["vcpu_headroom_over_peak"]),
+            step=0.05, key="sl_vcpu",
+        )
 
-        is_valid, err_msg = validate_risk_config(new_config)
+        # ── Business-hours schedule (Agent 2) ─────────────────────────────
+        st.markdown("**🕐 Business-Hours Schedule (Agent 2)**")
+        cfg["scheduling"]["business_hours_per_day"] = st.slider(
+            "Business hours/day", 1.0, 24.0,
+            float(cfg["scheduling"]["business_hours_per_day"]),
+            step=0.5, key="sl_biz_hrs",
+        )
+        cfg["scheduling"]["business_days_per_week"] = st.slider(
+            "Business days/week", 1.0, 7.0,
+            float(cfg["scheduling"]["business_days_per_week"]),
+            step=1.0, key="sl_biz_days",
+        )
+
+        # ── Risk verdict thresholds (Agent 3) ─────────────────────────────
+        st.markdown("**🎯 Risk Verdict Thresholds (Agent 3)**")
+        approve_max_val = float(cfg["risk"]["verdict_thresholds"]["approve_max"])
+        conditional_max_val = float(cfg["risk"]["verdict_thresholds"]["conditional_max"])
+        cfg["risk"]["verdict_thresholds"]["approve_max"] = st.slider(
+            "Auto-approve below score", 0.0, 100.0, approve_max_val,
+            step=1.0, key="sl_approve_max",
+            help="Scores at or below this are immediately APPROVED.",
+        )
+        cfg["risk"]["verdict_thresholds"]["conditional_max"] = st.slider(
+            "Reject above score", cfg["risk"]["verdict_thresholds"]["approve_max"], 100.0,
+            max(cfg["risk"]["verdict_thresholds"]["approve_max"] + 1, conditional_max_val),
+            step=1.0, key="sl_conditional_max",
+            help="Scores above this are REJECTED. Between the two = APPROVED WITH CONDITIONS.",
+        )
+
+        # ── Risk factor base scores (Agent 3) ─────────────────────────────
+        st.markdown("**⚡ Risk Factor Base Scores (Agent 3)**")
+        for score_key, label in [
+            ("environment_production", "Production Base Risk"),
+            ("environment_nonprod",    "Non-Production Base Risk"),
+            ("criticality_high",       "Critical Workload Risk (DB/API)"),
+            ("criticality_low",        "Standard Workload Risk"),
+            ("dependency_database",    "Database Dependency Risk"),
+            ("dependency_other",       "Other Dependency Risk"),
+        ]:
+            cfg["risk"]["factor_scores"][score_key] = float(st.slider(
+                label, 0, 100,
+                int(cfg["risk"]["factor_scores"][score_key]),
+                step=5, key=f"sl_fs_{score_key}",
+            ))
+
+        # ── Risk factor weights (Agent 3) ─────────────────────────────────
+        st.markdown("**⚖️ Risk Factor Weights (must sum to 1.0)**")
+        weight_labels = {
+            "environment_risk": "Environment Risk Weight",
+            "criticality_risk": "Criticality Risk Weight",
+            "capacity_risk":    "Capacity Risk Weight",
+            "uncertainty_risk": "Uncertainty Risk Weight",
+            "dependency_risk":  "Dependency Risk Weight",
+        }
+        for wkey, wlabel in weight_labels.items():
+            cfg["risk"]["weights"][wkey] = st.slider(
+                wlabel, 0.0, 1.0,
+                float(cfg["risk"]["weights"][wkey]),
+                step=0.05, key=f"sl_w_{wkey}",
+            )
+        weight_sum = round(sum(cfg["risk"]["weights"].values()), 3)
+        if abs(weight_sum - 1.0) < 0.01:
+            st.caption(f"✅ Weights sum: {weight_sum:.2f}")
+        else:
+            st.warning(f"⚠️ Weights sum to {weight_sum:.3f} — must equal 1.0")
+
+        # ── Validation guard ──────────────────────────────────────────────
+        is_valid, err_list = validate_config(cfg)
         if not is_valid:
-            st.error(f"⚠️ {err_msg}")
-        elif new_config != st.session_state.risk_config:
-            st.session_state.risk_config = new_config
-            # Invalidate cached per-server assessments so they recalculate with new policy
-            for k in list(st.session_state.keys()):
-                if k.startswith("sre_") or k.startswith("arb_"):
-                    del st.session_state[k]
-            st.rerun()
+            for e in err_list:
+                st.error(f"⚠️ {e}")
+        else:
+            if cfg != st.session_state.config:
+                st.session_state.config = cfg
+                # bridge for any code still referencing risk_config directly
+                st.session_state.risk_config = cfg["risk"]
+                for k in list(st.session_state.keys()):
+                    if k.startswith("sre_") or k.startswith("arb_"):
+                        del st.session_state[k]
+                st.rerun()
 
         c_save, c_reset = st.columns(2)
         with c_save:
             if st.button("💾 Save Policy", use_container_width=True, key="btn_save_policy"):
-                save_risk_config(st.session_state.risk_config)
-                st.toast("Policy persisted to disk (risk_config.json)!", icon="💾")
+                try:
+                    save_config(st.session_state.config)
+                    st.toast("Policy persisted to disk (config.json)!", icon="💾")
+                except ValueError as exc:
+                    st.error(str(exc))
         with c_reset:
             if st.button("🔄 Reset Defaults", use_container_width=True, key="btn_reset_policy"):
-                st.session_state.risk_config = copy.deepcopy(DEFAULT_RISK_CONFIG)
-                save_risk_config(DEFAULT_RISK_CONFIG)
+                st.session_state.config = copy.deepcopy(DEFAULT_CONFIG)
+                st.session_state.risk_config = DEFAULT_CONFIG["risk"]
                 for k in list(st.session_state.keys()):
                     if k.startswith("sre_") or k.startswith("arb_"):
                         del st.session_state[k]
@@ -553,15 +643,25 @@ with st.sidebar:
 if provider_filter != "All":
     fleet = [s for s in fleet if s["provider"] == provider_filter]
 
-scans = UsageDetectiveAgent.scan_fleet(fleet)
+_cfg = st.session_state.config
+_is_cfg_valid, _cfg_errors = validate_config(_cfg)
+
+if not _is_cfg_valid:
+    st.error("⚠️ **Invalid Policy Configuration** — agent pipeline is blocked until errors are resolved:")
+    for _e in _cfg_errors:
+        st.error(f"  • {_e}")
+    st.stop()
+
+scans = UsageDetectiveAgent.scan_fleet(fleet, config=_cfg)
 optimizations: dict[str, dict] = {}
 risk_profiles: dict[str, dict] = {}
 
+_full_month_hours = _cfg["scheduling"]["full_month_hours"]
 for scan in scans:
     sid = scan["server_id"]
     raw = scan["raw_server"]
     try:
-        opt = RightsizingOptimizerAgent.optimize(scan)
+        opt = RightsizingOptimizerAgent.optimize(scan, config=_cfg)
     except Exception as e:
         opt = {
             "server_id": sid,
@@ -572,8 +672,8 @@ for scan in scans:
             "target_tier": "ERROR",
             "target_ram_gb": None,
             "target_vcpu": None,
-            "current_monthly_cost": raw.get("hourly_cost_usd", 0) * 730,
-            "proposed_monthly_cost": raw.get("hourly_cost_usd", 0) * 730,
+            "current_monthly_cost": raw.get("hourly_cost_usd", 0) * _full_month_hours,
+            "proposed_monthly_cost": raw.get("hourly_cost_usd", 0) * _full_month_hours,
             "monthly_savings_usd": 0.0,
             "savings_pct": 0.0,
             "safety_headroom_pct": None,
@@ -581,18 +681,18 @@ for scan in scans:
             "_error": str(e),
         }
     optimizations[sid] = opt
-    risk_profiles[sid] = compute_risk_score(raw, opt, config=st.session_state.risk_config)
+    risk_profiles[sid] = compute_risk_score(raw, opt, config=_cfg)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # OPTION 1: MULTI-CLOUD SYNTHETIC FLEET (WITH BEECEPTOR DISPATCH & 4 AGENTS)
 # ─────────────────────────────────────────────────────────────────────────────
 def render_synthetic_fleet_tab(scans, optimizations, risk_profiles, beeceptor_url):
-    curr_vt = st.session_state.risk_config.get("verdict_thresholds", {"low_max": 30, "medium_max": 60})
+    curr_vt = st.session_state.config["risk"].get("verdict_thresholds", {"approve_max": 30, "conditional_max": 60})
     total_current   = sum(o["current_monthly_cost"] for o in optimizations.values())
     total_optimized = sum(o["proposed_monthly_cost"] for o in optimizations.values())
     net_savings     = total_current - total_optimized
     wasted_count    = sum(1 for s in scans if s["is_flagged"])
-    high_risk_count = sum(1 for r in risk_profiles.values() if r["risk_score"] > curr_vt.get("medium_max", 60))
+    high_risk_count = sum(1 for r in risk_profiles.values() if r["risk_score"] > curr_vt.get("conditional_max", 60))
 
     st.markdown("<h1 style='margin-bottom:0'>⚡ CloudSage Fleet Dashboard</h1>", unsafe_allow_html=True)
     st.markdown(
@@ -847,7 +947,7 @@ def render_synthetic_fleet_tab(scans, optimizations, risk_profiles, beeceptor_ur
             sre_res = SRERiskOfficerAgent.assess(
                 selected_server, selected_opt,
                 gemini_client=st.session_state.gemini_client,
-                config=st.session_state.risk_config,
+                config=st.session_state.config,
             )
             arb_res = FinOpsArbitratorAgent.arbitrate(
                 selected_server, selected_opt, sre_res,

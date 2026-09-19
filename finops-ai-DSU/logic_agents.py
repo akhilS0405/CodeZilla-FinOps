@@ -2,9 +2,14 @@
 logic_agents.py — Agent 1 (UsageDetectiveAgent) & Agent 2 (RightsizingOptimizerAgent)
 All arithmetic is pure Python — no LLM involved here.
 Cloud Catalog is frozen per Section 3A of the build spec.
+
+Both agents now accept a `config: dict` parameter (from config.py) so that
+every detection threshold, sizing multiplier, and scheduling constant comes
+from the unified config rather than being baked in as a literal.
 """
 
 import math
+from config import DEFAULT_CONFIG, compute_active_hours_per_month
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Multi-Cloud Pricing Catalog (frozen, Section 3A)
@@ -33,7 +38,7 @@ CLOUD_CATALOG = {
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FinOps Governance Policy Engine
+# FinOps Governance Policy Engine (kept for documentation and per-env naming)
 # ─────────────────────────────────────────────────────────────────────────────
 from dataclasses import dataclass
 
@@ -41,14 +46,15 @@ from dataclasses import dataclass
 class FinOpsEnvironmentPolicy:
     """
     Enterprise FinOps policy threshold configuration aligned with FinOps Foundation standards.
-    Allows customized waste-detection thresholds per environment tier.
+    Kept as a named container for per-environment documentation.
+    When a config dict is supplied to scan_server(), config["detection"] takes precedence.
     """
-    max_p95_cpu_percent: float = 15.0         # Workloads below this are candidates for rightsizing
-    max_ram_utilization_ratio: float = 0.35    # Workloads below 35% RAM ratio are candidates
-    min_gpu_utilization_percent: float = 2.0   # Minimum active GPU utilization threshold
-    max_gpu_idle_hours: float = 6.0           # Hours of continuous GPU inactivity before flag
-    min_network_transfer_mb_day: float = 5.0   # Minimum network I/O to avoid zombie classification
-    business_hours_weekly_cap: int = 168       # 24/7 continuous runtime threshold (vs 45h business week)
+    max_p95_cpu_percent: float = 15.0
+    max_ram_utilization_ratio: float = 0.35
+    min_gpu_utilization_percent: float = 2.0
+    max_gpu_idle_hours: float = 6.0
+    min_network_transfer_mb_day: float = 5.0
+    business_hours_weekly_cap: int = 168
     policy_tier_name: str = "Enterprise Standard"
 
 
@@ -90,14 +96,18 @@ FINOPS_GOVERNANCE_POLICIES: dict[str, FinOpsEnvironmentPolicy] = {
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Agent 1 — UsageDetectiveAgent (Enterprise Policy-Driven)
+# Agent 1 — UsageDetectiveAgent (Config-Driven, Enterprise Policy-Aware)
 # ─────────────────────────────────────────────────────────────────────────────
 class UsageDetectiveAgent:
     """
     Agent 1 — Usage Detective
     Policy-driven multi-cloud infrastructure audit engine.
-    Evaluates fleets against 4 key FinOps waste vectors with statistical confidence scoring.
+    Evaluates fleets against 4 key FinOps waste vectors.
     Pure Python — zero LLM hallucinations.
+
+    All detection thresholds are read from config["detection"] when a config
+    dict is supplied, so organizations can tune sensitivity without code changes.
+    Falls back to the FinOpsEnvironmentPolicy object for backward compatibility.
     """
 
     @staticmethod
@@ -108,64 +118,98 @@ class UsageDetectiveAgent:
         )
 
     @classmethod
-    def scan_server(cls, server: dict, policy: FinOpsEnvironmentPolicy | None = None) -> dict:
+    def scan_server(
+        cls,
+        server: dict,
+        config: dict | None = None,
+        policy: FinOpsEnvironmentPolicy | None = None,
+    ) -> dict:
+        """
+        Scan one server for waste.
+
+        Parameters
+        ----------
+        server : dict  — raw server record from fleet_data
+        config : dict  — unified CloudSage config (preferred); detection thresholds
+                         are read from config["detection"] when supplied
+        policy : FinOpsEnvironmentPolicy — fallback when config is None
+        """
         env = str(server.get("environment", "production")).lower()
-        active_policy = policy or cls.get_policy_for_env(env)
+
+        # ── Resolve detection thresholds ─────────────────────────────────────
+        if config is not None:
+            d = config["detection"]
+            cpu_max_pct         = d["overprovisioned_cpu_max_pct"]
+            ram_max_ratio       = d["overprovisioned_ram_max_ratio"]
+            gpu_util_max_pct    = d["zombie_gpu_util_max_pct"]
+            gpu_idle_hours_min  = d["zombie_gpu_idle_hours_min"]
+            net_max_mb_day      = d["zombie_network_max_mb_day"]
+            sched_hours_cap     = d["unscheduled_hours_per_week_threshold"]
+            policy_tier_name    = "Unified CloudSage Config"
+        else:
+            active_policy = policy or cls.get_policy_for_env(env)
+            cpu_max_pct         = active_policy.max_p95_cpu_percent
+            ram_max_ratio       = active_policy.max_ram_utilization_ratio
+            gpu_util_max_pct    = active_policy.min_gpu_utilization_percent
+            gpu_idle_hours_min  = active_policy.max_gpu_idle_hours
+            net_max_mb_day      = active_policy.min_network_transfer_mb_day
+            sched_hours_cap     = active_policy.business_hours_weekly_cap
+            policy_tier_name    = active_policy.policy_tier_name
 
         reasons = []
         confidence_scores = {}
         evidence = {}
         is_gpu_workload = server.get("workload_type") == "ai_inference"
 
-        # ── Vector 1: Overprovisioned Compute & Memory ──────────────────────
-        # GPU workloads are excluded — GPU servers are evaluated on accelerator efficiency
+        # ── Vector 1: Overprovisioned Compute & Memory ───────────────────────
+        # GPU workloads excluded — evaluated on accelerator efficiency instead
         if not is_gpu_workload:
             p95_cpu = server.get("p95_cpu_percent", 0.0)
             tot_ram = max(server.get("total_ram_gb", 1.0), 1.0)
             ram_ratio = server.get("p95_ram_used_gb", 0.0) / tot_ram
 
-            if p95_cpu < active_policy.max_p95_cpu_percent and ram_ratio < active_policy.max_ram_utilization_ratio:
+            if p95_cpu < cpu_max_pct and ram_ratio < ram_max_ratio:
                 reasons.append("OVERPROVISIONED")
-                # Confidence scales with how far below the policy threshold the workload operates
-                cpu_slack = (active_policy.max_p95_cpu_percent - p95_cpu) / active_policy.max_p95_cpu_percent
-                ram_slack = (active_policy.max_ram_utilization_ratio - ram_ratio) / active_policy.max_ram_utilization_ratio
+                cpu_slack = (cpu_max_pct - p95_cpu) / cpu_max_pct
+                ram_slack = (ram_max_ratio - ram_ratio) / ram_max_ratio
                 conf = round(min(99.0, 70.0 + 30.0 * ((cpu_slack + ram_slack) / 2.0)), 1)
                 confidence_scores["OVERPROVISIONED"] = conf
                 evidence["OVERPROVISIONED"] = (
-                    f"p95 CPU ({p95_cpu:.1f}%) < policy limit ({active_policy.max_p95_cpu_percent:.1f}%) "
-                    f"AND RAM ratio ({ram_ratio*100:.1f}%) < policy limit ({active_policy.max_ram_utilization_ratio*100:.1f}%)"
+                    f"p95 CPU ({p95_cpu:.1f}%) < policy limit ({cpu_max_pct:.1f}%) "
+                    f"AND RAM ratio ({ram_ratio*100:.1f}%) < policy limit ({ram_max_ratio*100:.1f}%)"
                 )
 
-        # ── Vector 2: Zombie GPU Workload (Costly Accelerator Abandonment) ──
+        # ── Vector 2: Zombie GPU Workload (Costly Accelerator Abandonment) ───
         if is_gpu_workload:
             gpu_util = server.get("gpu_util_percent", 100.0)
             idle_hrs = server.get("gpu_idle_hours", 0.0)
 
-            if gpu_util < active_policy.min_gpu_utilization_percent and idle_hrs >= active_policy.max_gpu_idle_hours:
+            if gpu_util < gpu_util_max_pct and idle_hrs >= gpu_idle_hours_min:
                 reasons.append("ZOMBIE_GPU")
-                conf = round(min(99.0, 85.0 + min(14.0, (idle_hrs - active_policy.max_gpu_idle_hours) * 0.5)), 1)
+                conf = round(min(99.0, 85.0 + min(14.0, (idle_hrs - gpu_idle_hours_min) * 0.5)), 1)
                 confidence_scores["ZOMBIE_GPU"] = conf
                 evidence["ZOMBIE_GPU"] = (
-                    f"GPU utilization ({gpu_util:.1f}%) < {active_policy.min_gpu_utilization_percent:.1f}% "
-                    f"for {idle_hrs:.1f} consecutive hours (policy threshold: {active_policy.max_gpu_idle_hours:.1f}h)"
+                    f"GPU utilization ({gpu_util:.1f}%) < {gpu_util_max_pct:.1f}% "
+                    f"for {idle_hrs:.1f} consecutive hours (policy threshold: {gpu_idle_hours_min:.1f}h)"
                 )
 
-        # ── Vector 3: Zombie Idle Instance (Dead Server) ────────────────────
+        # ── Vector 3: Zombie Idle Instance (Dead Server) ─────────────────────
         net_traffic = server.get("network_in_out_mb_day", 999.0)
-        if net_traffic < active_policy.min_network_transfer_mb_day:
+        if net_traffic < net_max_mb_day:
             reasons.append("ZOMBIE_IDLE")
             confidence_scores["ZOMBIE_IDLE"] = 96.5
             evidence["ZOMBIE_IDLE"] = (
-                f"Network throughput ({net_traffic:.1f} MB/day) < policy minimum ({active_policy.min_network_transfer_mb_day:.1f} MB/day)"
+                f"Network throughput ({net_traffic:.1f} MB/day) < policy minimum ({net_max_mb_day:.1f} MB/day)"
             )
 
-        # ── Vector 4: Unscheduled Non-Production Instance ───────────────────
+        # ── Vector 4: Unscheduled Non-Production Instance ────────────────────
         runtime_hrs = server.get("runtime_hours_per_week", 0)
-        if env in ["dev", "staging", "qa"] and runtime_hrs == active_policy.business_hours_weekly_cap:
+        if env in ["dev", "staging", "qa"] and runtime_hrs == sched_hours_cap:
             reasons.append("UNSCHEDULED_NONPROD")
             confidence_scores["UNSCHEDULED_NONPROD"] = 99.0
             evidence["UNSCHEDULED_NONPROD"] = (
-                f"{env.upper()} environment running 168h/week (24/7 continuous spend instead of 45h business week)"
+                f"{env.upper()} environment running {int(sched_hours_cap)}h/week "
+                f"(24/7 continuous spend instead of business-hours schedule)"
             )
 
         return {
@@ -173,24 +217,32 @@ class UsageDetectiveAgent:
             "is_flagged": len(reasons) > 0,
             "waste_reasons": reasons,
             "raw_server": server,
-            "policy_applied": active_policy.policy_tier_name,
+            "policy_applied": policy_tier_name,
             "confidence_scores": confidence_scores,
             "policy_evidence": evidence,
         }
 
     @classmethod
-    def scan_fleet(cls, fleet: list, policy: FinOpsEnvironmentPolicy | None = None) -> list:
+    def scan_fleet(
+        cls,
+        fleet: list,
+        config: dict | None = None,
+        policy: FinOpsEnvironmentPolicy | None = None,
+    ) -> list:
         """Scan a full fleet list and return a list of scan results."""
-        return [cls.scan_server(s, policy) for s in fleet]
+        return [cls.scan_server(s, config=config, policy=policy) for s in fleet]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Agent 2 — RightsizingOptimizerAgent
+# Agent 2 — RightsizingOptimizerAgent (Config-Driven)
 # ─────────────────────────────────────────────────────────────────────────────
 class RightsizingOptimizerAgent:
     """
     Produces a rightsizing recommendation for a flagged server.
     Pure Python — zero LLM calls.
+
+    All sizing multipliers and scheduling constants are read from config["sizing"]
+    and config["scheduling"] when a config dict is supplied.
 
     Frozen output schema:
         server_id, provider, from_tier, to_tier, target_ram_gb,
@@ -199,23 +251,40 @@ class RightsizingOptimizerAgent:
     """
 
     @staticmethod
-    def optimize(server_scan: dict) -> dict:
+    def optimize(server_scan: dict, config: dict | None = None) -> dict:
+        """
+        Parameters
+        ----------
+        server_scan : dict — output of UsageDetectiveAgent.scan_server
+        config      : dict — unified CloudSage config; sizing & scheduling
+                             thresholds are read from config["sizing"] and
+                             config["scheduling"] when supplied
+        """
+        if config is None:
+            config = DEFAULT_CONFIG
+
         server = server_scan["raw_server"]
         reasons = server_scan["waste_reasons"]
         provider = server.get("provider")
 
-        # Fix: raise immediately for unknown provider — no silent fallback
+        sizing = config["sizing"]
+        sched  = config["scheduling"]
+
+        full_month_hours = sched["full_month_hours"]
+
+        # Raise immediately for unknown provider — no silent fallback
         if provider not in CLOUD_CATALOG:
             raise ValueError(f"No catalog defined for provider: {provider}")
 
         catalog = CLOUD_CATALOG[provider]
-        current_monthly = server.get("hourly_cost_usd", 0.1) * 730
+        current_monthly = server.get("hourly_cost_usd", 0.1) * full_month_hours
 
-        # ── Zombie GPU path ─────────────────────────────────────────────────
-        # Flat 10% of TOTAL current cost — deliberate scope simplification.
-        # There is no compute/disk cost split in this demo.
+        # ── Zombie GPU path ──────────────────────────────────────────────────
+        # Retain a configurable fraction of total cost — no resize, just hibernate.
         if "ZOMBIE_GPU" in reasons:
-            proposed_monthly = current_monthly * 0.10
+            hibernate_fraction = sizing["zombie_gpu_hibernate_cost_fraction"]
+            proposed_monthly = current_monthly * hibernate_fraction
+            savings_pct = round((1 - hibernate_fraction) * 100, 1)
             return {
                 "server_id": server["server_id"],
                 "provider": provider,
@@ -228,26 +297,28 @@ class RightsizingOptimizerAgent:
                 "current_monthly_cost": round(current_monthly, 2),
                 "proposed_monthly_cost": round(proposed_monthly, 2),
                 "monthly_savings_usd": round(current_monthly - proposed_monthly, 2),
-                "savings_pct": 90.0,
+                "savings_pct": savings_pct,
                 "safety_headroom_pct": None,  # not applicable — no resize occurred
                 "action_type": "HIBERNATE_ZOMBIE_GPU",
             }
 
-        # ── Standard rightsizing path ───────────────────────────────────────
+        # ── Standard rightsizing path ────────────────────────────────────────
         peak_ram = server.get("peak_ram_used_gb", server.get("p95_ram_used_gb", 2.0))
-        p95_ram = server.get("p95_ram_used_gb", peak_ram)
-        target_ram = max(peak_ram * 1.30, p95_ram * 1.40)
+        p95_ram  = server.get("p95_ram_used_gb", peak_ram)
+        target_ram = max(
+            peak_ram * sizing["ram_headroom_over_peak"],
+            p95_ram  * sizing["ram_headroom_over_p95"],
+        )
 
-        # Fix: peak_vcpus_used is now required — no silent guess at 50%
+        # peak_vcpus_used is required — no silent guess
         peak_vcpu = server.get("peak_vcpus_used")
         if peak_vcpu is None:
             raise ValueError(
                 f"Server {server.get('server_id')} missing required field: peak_vcpus_used"
             )
-        target_vcpu = max(1, math.ceil(peak_vcpu * 1.25))
+        target_vcpu = max(1, math.ceil(peak_vcpu * sizing["vcpu_headroom_over_peak"]))
 
         # Exclude GPU tiers — never rightsize a non-GPU workload onto GPU hardware.
-        # (GPU workloads already exited above via the ZOMBIE_GPU path.)
         eligible = [
             inst
             for inst in catalog
@@ -276,19 +347,17 @@ class RightsizingOptimizerAgent:
 
         best_match = min(eligible, key=lambda x: x["cost_hr"])
 
-        # UNSCHEDULED_NONPROD servers billed at 195 active hours/month (5 days/wk × ~9h)
-        active_hours = 195 if "UNSCHEDULED_NONPROD" in reasons else 730
+        # UNSCHEDULED_NONPROD servers billed at business-hours schedule; others at full month
+        active_hours = (
+            compute_active_hours_per_month(sched)
+            if "UNSCHEDULED_NONPROD" in reasons
+            else full_month_hours
+        )
         proposed_monthly = best_match["cost_hr"] * active_hours
         monthly_savings = max(0.0, current_monthly - proposed_monthly)
-        savings_pct = (
-            (monthly_savings / current_monthly * 100) if current_monthly > 0 else 0
-        )
-        headroom_pct = (
-            (best_match["ram_gb"] - peak_ram) / best_match["ram_gb"]
-        ) * 100
-        action = (
-            "DOWNSIZE_AND_SCHEDULE" if active_hours < 730 else "DOWNSIZE_INSTANCE"
-        )
+        savings_pct = (monthly_savings / current_monthly * 100) if current_monthly > 0 else 0
+        headroom_pct = ((best_match["ram_gb"] - peak_ram) / best_match["ram_gb"]) * 100
+        action = "DOWNSIZE_AND_SCHEDULE" if active_hours < full_month_hours else "DOWNSIZE_INSTANCE"
 
         return {
             "server_id": server["server_id"],

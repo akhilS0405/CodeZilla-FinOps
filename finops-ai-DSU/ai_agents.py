@@ -1,11 +1,18 @@
 """
 ai_agents.py — Agent 3 (SRERiskOfficerAgent) & Agent 4 (FinOpsArbitratorAgent)
 Hybrid design: Python computes every number; Gemini only narrates already-computed facts.
-Every LLM call has a timeout + try/except → template fallback.
+Every LLM call has a timeout + try/except -> template fallback.
+
+compute_risk_score() reads all weights, factor scores, and thresholds from
+config["risk"] — no numeric literals inside formula bodies.
 """
 
 from google import genai
 from google.genai import types as genai_types
+
+import copy
+from twin_agent_bridge import get_twin_verdict
+from config import DEFAULT_CONFIG
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -41,70 +48,75 @@ def make_gemini_client(api_key: str):
 # Agent 3 — SRERiskOfficerAgent
 # ─────────────────────────────────────────────────────────────────────────────
 
-import copy
-from twin_agent_bridge import get_twin_verdict
-
-# Import risk config from dedicated module (avoids Streamlit hot-reload cache issues)
-from risk_config_store import (
-    DEFAULT_RISK_CONFIG,
-    validate_risk_config,
-    load_risk_config,
-    save_risk_config,
-)
-
-
 def compute_risk_score(server: dict, optimization: dict, config: dict | None = None) -> dict:
     """
-    Config-driven Python deterministic risk formula with DigitalTwin historical replay verification.
-    All factors and thresholds read dynamically from `config` instead of literals.
+    Config-driven Python deterministic risk formula with DigitalTwin historical
+    replay verification. All factors and thresholds are read from config["risk"]
+    — no numeric literals inside the formula body.
+
+    Parameters
+    ----------
+    server       : raw server dict from fleet_data
+    optimization : output of RightsizingOptimizerAgent.optimize
+    config       : unified CloudSage config dict (from config.py).
+                   Falls back to DEFAULT_CONFIG when None.
     """
     if config is None:
-        config = DEFAULT_RISK_CONFIG
+        config = DEFAULT_CONFIG
 
-    w = config.get("weights", DEFAULT_RISK_CONFIG["weights"])
-    fs = config.get("factor_scores", DEFAULT_RISK_CONFIG["factor_scores"])
-    ct = config.get("capacity_thresholds", DEFAULT_RISK_CONFIG["capacity_thresholds"])
-    cs = config.get("capacity_scores", DEFAULT_RISK_CONFIG["capacity_scores"])
-    vt = config.get("verdict_thresholds", DEFAULT_RISK_CONFIG["verdict_thresholds"])
+    r  = config["risk"]
+    w  = r["weights"]
+    fs = r["factor_scores"]
+    ct = r["capacity_thresholds_pct"]
+    cs = r["capacity_scores"]
+    vt = r["verdict_thresholds"]
 
+    # ── Environment factor ───────────────────────────────────────────────────
     env = server.get("environment", "production")
     environment_risk = (
-        fs.get("environment_production", 90) if env == "production" else fs.get("environment_nonprod", 20)
+        fs["environment_production"] if env == "production" else fs["environment_nonprod"]
     )
 
+    # ── Criticality factor ───────────────────────────────────────────────────
     is_critical = server.get("workload_type") in ("database", "web_api") and env == "production"
-    criticality_risk = fs.get("criticality_high", 90) if is_critical else fs.get("criticality_low", 30)
+    criticality_risk = fs["criticality_high"] if is_critical else fs["criticality_low"]
 
+    # ── Capacity / headroom factor ───────────────────────────────────────────
     headroom = optimization.get("safety_headroom_pct")
     if headroom is None:
-        capacity_risk = cs.get("moderate", 50)  # hibernation path — unknown until re-activated
-    elif headroom < ct.get("tight", 15):
-        capacity_risk = cs.get("tight", 85)
-    elif headroom < ct.get("moderate", 30):
-        capacity_risk = cs.get("moderate", 50)
+        capacity_risk = cs["moderate"]   # hibernation path — headroom unknown until re-activated
+    elif headroom < ct["tight"]:
+        capacity_risk = cs["tight"]
+    elif headroom < ct["moderate"]:
+        capacity_risk = cs["moderate"]
     else:
-        capacity_risk = cs.get("safe", 15)
+        capacity_risk = cs["safe"]
 
+    # ── Uncertainty / volatility factor ─────────────────────────────────────
+    ram_gap = server.get("peak_ram_used_gb", 0) - server.get("p95_ram_used_gb", 0)
     uncertainty_risk = (
-        fs.get("uncertainty_high", 60)
-        if server.get("p95_cpu_percent", 0) > 0
-        and (server.get("peak_ram_used_gb", 0) - server.get("p95_ram_used_gb", 0)) > 5
-        else fs.get("uncertainty_low", 20)
+        fs["uncertainty_high"]
+        if server.get("p95_cpu_percent", 0) > 0 and ram_gap > r["uncertainty_ram_gap_threshold_gb"]
+        else fs["uncertainty_low"]
     )
 
+    # ── Dependency factor ────────────────────────────────────────────────────
     dependency_risk = (
-        fs.get("dependency_database", 70) if server.get("workload_type") == "database" else fs.get("dependency_other", 25)
+        fs["dependency_database"]
+        if server.get("workload_type") == "database"
+        else fs["dependency_other"]
     )
 
+    # ── Weighted sum ─────────────────────────────────────────────────────────
     base_risk_score = round(
-        w.get("environment_risk", 0.25) * environment_risk
-        + w.get("criticality_risk", 0.25) * criticality_risk
-        + w.get("capacity_risk", 0.20) * capacity_risk
-        + w.get("uncertainty_risk", 0.15) * uncertainty_risk
-        + w.get("dependency_risk", 0.15) * dependency_risk
+        w["environment_risk"]  * environment_risk
+        + w["criticality_risk"]  * criticality_risk
+        + w["capacity_risk"]     * capacity_risk
+        + w["uncertainty_risk"]  * uncertainty_risk
+        + w["dependency_risk"]   * dependency_risk
     )
 
-    # Replay historical demand using DigitalTwin
+    # ── Digital Twin historical replay verification ──────────────────────────
     twin = get_twin_verdict(
         server.get("server_id", ""),
         optimization,
@@ -113,11 +125,12 @@ def compute_risk_score(server: dict, optimization: dict, config: dict | None = N
 
     risk_score = min(100, base_risk_score + twin.get("twin_risk_penalty", 0))
 
+    # ── Three-tier verdict ───────────────────────────────────────────────────
     if twin.get("verdict") == "UNSAFE":
         verdict = "REJECTED"
-    elif risk_score <= vt.get("low_max", 30):
+    elif risk_score <= vt["approve_max"]:
         verdict = "APPROVED"
-    elif risk_score <= vt.get("medium_max", 60):
+    elif risk_score <= vt["conditional_max"]:
         verdict = "APPROVED_WITH_CONDITIONS"
     else:
         verdict = "REJECTED"
@@ -180,7 +193,12 @@ class SRERiskOfficerAgent:
     """Wrapper that bundles compute_risk_score + sre_explain with configurable policy support."""
 
     @staticmethod
-    def assess(server: dict, optimization: dict, gemini_client=None, config: dict | None = None) -> dict:
+    def assess(
+        server: dict,
+        optimization: dict,
+        gemini_client=None,
+        config: dict | None = None,
+    ) -> dict:
         risk = compute_risk_score(server, optimization, config=config)
         narration = sre_explain(server, optimization, risk, gemini_client)
         return {**risk, "narration": narration}
@@ -192,7 +210,7 @@ class SRERiskOfficerAgent:
 
 def compute_roi(optimization: dict) -> dict:
     """
-    Pure Python. 12-month ROI is arithmetic — monthly_savings × 12.
+    Pure Python. 12-month ROI is arithmetic — monthly_savings x 12.
     Never LLM-generated.
     """
     monthly = optimization.get("monthly_savings_usd", 0.0)
